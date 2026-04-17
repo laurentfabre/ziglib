@@ -81,6 +81,21 @@ pub const Cache = struct {
         return file.readToEndAlloc(self.allocator, std.math.maxInt(usize)) catch null;
     }
 
+    /// Read a cached value, bypassing the TTL check — returns whatever
+    /// is on disk regardless of age. Intended for offline fallback:
+    /// callers normally use `get`, then fall back to `getStale` only
+    /// when the live fetch has already failed. Caller owns the returned
+    /// bytes; null on miss or any I/O error.
+    pub fn getStale(self: *Cache, key: []const u8) ?[]const u8 {
+        const path = self.keyToPath(key) catch return null;
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+        defer file.close();
+
+        return file.readToEndAlloc(self.allocator, std.math.maxInt(usize)) catch null;
+    }
+
     /// Write a value to the cache. Silently drops write errors; callers
     /// treat cache writes as best-effort.
     pub fn put(self: *Cache, key: []const u8, value: []const u8) void {
@@ -195,6 +210,40 @@ test "Cache: expired entry returns null" {
     // ensure mtime < now on filesystems with second-resolution timestamps.
     std.Thread.sleep(10 * std.time.ns_per_ms);
     try std.testing.expect(cache.get("stale") == null);
+}
+
+test "Cache: getStale returns expired entries that get() drops" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs);
+
+    var cache = try Cache.initAt(allocator, abs, 0); // 0s TTL → always expired
+    defer cache.deinit();
+
+    cache.put("alpha", "still useful offline");
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    try std.testing.expect(cache.get("alpha") == null);
+    const stale = cache.getStale("alpha") orelse return error.UnexpectedMiss;
+    defer allocator.free(stale);
+    try std.testing.expectEqualStrings("still useful offline", stale);
+}
+
+test "Cache: getStale returns null when the key has never been written" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(abs);
+
+    var cache = try Cache.initAt(allocator, abs, null);
+    defer cache.deinit();
+
+    try std.testing.expect(cache.getStale("never-written") == null);
 }
 
 test "Cache: makeKey joins components with ':'" {
