@@ -37,6 +37,50 @@ pub fn isTTY() bool {
     return posix.isatty(posix.STDOUT_FILENO);
 }
 
+// ── Writergate bridges ────────────────────────────────────────────────
+//
+// `std.fs.File.deprecatedWriter()` is a 0.15-only shim that 0.16 will
+// remove. The replacement (`File.writer(buf) -> Writer{ .interface }`)
+// requires both the buffer and the `File.Writer` struct to live at a
+// stable address while in use, because `drain` recovers the parent via
+// `@fieldParentPtr("interface", io_w)`.
+//
+// To keep call sites compact, callers stack-allocate one of these
+// structs and hand its `writer()` method out as a `*std.Io.Writer`.
+// Zero-byte buffer means writes go straight to the syscall — same
+// observable behavior as `deprecatedWriter`, no `flush()` required.
+//
+//     var sw: term.StdoutWriter = .{};
+//     try run(args, sw.writer());
+
+pub const StdoutWriter = struct {
+    buf: [0]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
+    initialized: bool = false,
+
+    pub fn writer(self: *StdoutWriter) *std.Io.Writer {
+        if (!self.initialized) {
+            self.fw = std.fs.File.stdout().writer(&self.buf);
+            self.initialized = true;
+        }
+        return &self.fw.interface;
+    }
+};
+
+pub const StderrWriter = struct {
+    buf: [0]u8 = undefined,
+    fw: std.fs.File.Writer = undefined,
+    initialized: bool = false,
+
+    pub fn writer(self: *StderrWriter) *std.Io.Writer {
+        if (!self.initialized) {
+            self.fw = std.fs.File.stderr().writer(&self.buf);
+            self.initialized = true;
+        }
+        return &self.fw.interface;
+    }
+};
+
 // ── Spinner ───────────────────────────────────────────────────────────
 
 /// Animated terminal spinner. Two-phase init/run pattern is required so the
