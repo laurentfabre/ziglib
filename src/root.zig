@@ -7,6 +7,7 @@
 //!   * cli    — argument parsing: flags, values, positionals, urlEncode, homeDir.
 //!   * text   — token-budget truncation, ANSI-escape stripping.
 //!   * french — French locale helpers: date parsing/formatting (FEC, display, ISO).
+//!   * xlsx   — read-only Office Open XML spreadsheet reader (shared strings, rows, typed cells).
 
 pub const otel = @import("otel.zig");
 pub const term = @import("term.zig");
@@ -14,6 +15,7 @@ pub const cache = @import("cache.zig");
 pub const cli = @import("cli.zig");
 pub const text = @import("text.zig");
 pub const french = @import("french.zig");
+pub const xlsx = @import("xlsx.zig");
 
 test {
     // Discover nested tests.
@@ -23,4 +25,5 @@ test {
     _ = cli;
     _ = text;
     _ = french;
+    _ = xlsx;
 }
