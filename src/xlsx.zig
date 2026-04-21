@@ -289,8 +289,12 @@ pub const Rows = struct {
             try self.resolveSharedString(body)
         else if (std.mem.eql(u8, cell_type, "str"))
             .{ .string = try self.decodeVValue(body) }
-        else if (std.mem.eql(u8, cell_type, "b"))
-            .{ .boolean = (extractVValue(body) orelse "0")[0] == '1' }
+        else if (std.mem.eql(u8, cell_type, "b")) blk: {
+            // Empty `<v></v>` is still valid XML; treat it as false rather
+            // than crashing on the [0] index.
+            const raw = extractVValue(body) orelse "";
+            break :blk .{ .boolean = raw.len > 0 and raw[0] == '1' };
+        }
         else if (std.mem.eql(u8, cell_type, "e"))
             .{ .string = try self.decodeVValue(body) }
         else
@@ -957,7 +961,7 @@ fn mutate(rng: std.Random, src: []const u8, dst: []u8) []u8 {
             },
             2 => {
                 // Byte insert at random position
-                if (len + 1 >= dst.len) continue;
+                if (len + 1 > dst.len) continue;
                 const i = rng.intRangeAtMost(usize, 0, len);
                 std.mem.copyBackwards(u8, dst[i + 1 .. len + 1], dst[i..len]);
                 dst[i] = rng.int(u8);
@@ -969,7 +973,7 @@ fn mutate(rng: std.Random, src: []const u8, dst: []u8) []u8 {
                 // `src.len` — because mutation may have grown dst past
                 // src's tail.
                 const run = rng.intRangeAtMost(usize, 1, @min(16, len));
-                if (len + run >= dst.len) continue;
+                if (len + run > dst.len) continue;
                 const from = rng.intRangeAtMost(usize, 0, len - run);
                 const to = rng.intRangeAtMost(usize, 0, len);
                 // Save the run before shifting (the shift may clobber it).
@@ -1012,6 +1016,74 @@ test "fuzz parseWorkbookSheets mutations" {
         var book: Book = .{ .allocator = std.testing.allocator };
         defer book.deinit();
         parseWorkbookSheets(&book, wb, rels) catch {};
+    }
+}
+
+/// Realistic worksheet XML exercising every cell type (`inlineStr`,
+/// shared-string `s`, `str`, boolean `b`, error `e`, numeric default),
+/// empty cells, self-closing cells, multi-row layout, and a stray
+/// `<f>` formula child.
+const sheet_template =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" ++
+    "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">" ++
+    "<sheetData>" ++
+    "<row r=\"1\">" ++
+    "<c r=\"A1\" t=\"inlineStr\"><is><t>alpha</t></is></c>" ++
+    "<c r=\"B1\" t=\"inlineStr\"><is><t>beta &amp; gamma</t></is></c>" ++
+    "<c r=\"D1\"/>" ++ // self-closing
+    "<c r=\"E1\" t=\"s\"><v>0</v></c>" ++
+    "</row>" ++
+    "<row r=\"2\">" ++
+    "<c r=\"A2\"><v>42</v></c>" ++
+    "<c r=\"B2\"><v>-3.14</v></c>" ++
+    "<c r=\"C2\" t=\"b\"><v>1</v></c>" ++
+    "<c r=\"D2\" t=\"e\"><v>#N/A</v></c>" ++
+    "<c r=\"E2\" t=\"str\"><f>A1</f><v>computed</v></c>" ++
+    "</row>" ++
+    "<row r=\"3\"><c r=\"Z3\" t=\"inlineStr\"><is><r><rPr><b/></rPr><t>rich</t></r><r><t> text</t></r></is></c></row>" ++
+    "</sheetData></worksheet>";
+
+/// Run the row iterator end-to-end on an xml buffer. Used by multiple
+/// fuzz tests — factored so both random-byte and mutation paths share
+/// the same state-machine exerciser.
+fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, xml: []const u8) void {
+    var rows: Rows = .{
+        .xml = xml,
+        .pos = 0,
+        .shared_strings = shared_strings,
+        .allocator = alloc,
+        .row_cells = .{},
+        .owned = .{},
+    };
+    defer rows.deinit();
+    var count: usize = 0;
+    while (rows.next() catch null) |_| : (count += 1) {
+        if (count > 4096) break; // defensive cap against pathological loops
+    }
+}
+
+test "fuzz Rows.next mutations on real sheet XML" {
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var dst: [fuzz_max_input_len]u8 = undefined;
+    // A 1-element SST so cells with t="s" can resolve index 0.
+    const sst = [_][]const u8{"shared-entry"};
+    for (0..iters) |_| {
+        const input = mutate(rng, sheet_template, &dst);
+        consumeAllRows(std.testing.allocator, &sst, input);
+    }
+}
+
+test "fuzz Rows.next on random bytes" {
+    const iters = fuzzIterations();
+    var prng = std.Random.DefaultPrng.init(fuzzSeed());
+    const rng = prng.random();
+    var buf: [fuzz_max_input_len]u8 = undefined;
+    const sst = [_][]const u8{"shared-entry"};
+    for (0..iters) |_| {
+        const input = randomInput(rng, &buf);
+        consumeAllRows(std.testing.allocator, &sst, input);
     }
 }
 
