@@ -40,6 +40,11 @@
 //!   otel.end(root, null, "cli", .internal, .ok, &.{});
 
 const std = @import("std");
+const Io = std.Io;
+
+fn nowNs(io: Io) i128 {
+    return @as(i128, Io.Clock.Timestamp.now(io, .real).raw.nanoseconds);
+}
 
 // =====================================================================
 //                         Core types
@@ -154,6 +159,14 @@ pub fn start(name: []const u8, parent: ?SpanContext) SpanContext {
     return t.startSpan(name, parent);
 }
 
+/// Get the io from the global tracer, or null if disabled. Useful for
+/// helper code that wants to record timestamps without plumbing `Io`
+/// through every call.
+pub fn globalIo() ?Io {
+    const t = global_tracer orelse return null;
+    return t.io;
+}
+
 /// End a span via the global tracer. No-op when ctx.isNull().
 pub fn end(
     ctx: SpanContext,
@@ -172,7 +185,11 @@ pub fn end(
 // =====================================================================
 
 /// Parse W3C traceparent header: "00-{32 hex trace_id}-{16 hex span_id}-{2 hex flags}"
-pub fn parseTraceparent(header: []const u8) ?SpanContext {
+///
+/// `io` is used to stamp `start_time_ns` with the wall clock at parse
+/// time. Pass `globalIo()` if no other source is handy; pass null only
+/// in tests where the start time is irrelevant.
+pub fn parseTraceparent(io: ?Io, header: []const u8) ?SpanContext {
     if (header.len < 55) return null;
     if (header[0] != '0' or header[1] != '0' or header[2] != '-') return null;
     if (header[35] != '-' or header[52] != '-') return null;
@@ -182,7 +199,7 @@ pub fn parseTraceparent(header: []const u8) ?SpanContext {
     ctx.span_id = hexDecode8(header[36..52]) orelse return null;
     const flags = hexDecodeByte(header[53..55]) orelse return null;
     ctx.sampled = (flags & 0x01) != 0;
-    ctx.start_time_ns = std.time.nanoTimestamp();
+    ctx.start_time_ns = if (io) |i| nowNs(i) else 0;
     return ctx;
 }
 
@@ -230,15 +247,16 @@ pub const Config = struct {
 pub const Tracer = struct {
     config: Config,
     allocator: std.mem.Allocator,
+    io: Io,
 
     // Ring buffer for completed spans.
     spans: [span_buffer_capacity]Span = undefined,
     span_head: usize = 0,
     span_count: usize = 0,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) Tracer {
-        return .{ .allocator = allocator, .config = config };
+    pub fn init(allocator: std.mem.Allocator, io: Io, config: Config) Tracer {
+        return .{ .allocator = allocator, .io = io, .config = config };
     }
 
     /// Flush remaining spans (best-effort) and free config strings.
@@ -259,7 +277,7 @@ pub const Tracer = struct {
 
         if (self.config.sample_rate < 1.0) {
             var rng_buf: [4]u8 = undefined;
-            std.crypto.random.bytes(&rng_buf);
+            Io.random(self.io, &rng_buf);
             const raw = std.mem.readInt(u32, &rng_buf, .little);
             const val: f32 = @as(f32, @floatFromInt(raw)) / @as(f32, @floatFromInt(std.math.maxInt(u32)));
             if (val > self.config.sample_rate) return null_ctx;
@@ -269,11 +287,11 @@ pub const Tracer = struct {
         if (parent) |p| {
             ctx.trace_id = p.trace_id;
         } else {
-            std.crypto.random.bytes(&ctx.trace_id);
+            Io.random(self.io, &ctx.trace_id);
         }
-        std.crypto.random.bytes(&ctx.span_id);
+        Io.random(self.io, &ctx.span_id);
         ctx.sampled = true;
-        ctx.start_time_ns = std.time.nanoTimestamp();
+        ctx.start_time_ns = nowNs(self.io);
         return ctx;
     }
 
@@ -294,7 +312,7 @@ pub const Tracer = struct {
             .span_id = ctx.span_id,
             .kind = kind,
             .start_time_ns = ctx.start_time_ns,
-            .end_time_ns = std.time.nanoTimestamp(),
+            .end_time_ns = nowNs(self.io),
             .status = status,
         };
 
@@ -313,8 +331,8 @@ pub const Tracer = struct {
             span.attr_count = i + 1;
         }
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.spans[self.span_head] = span;
         self.span_head = (self.span_head + 1) % span_buffer_capacity;
         if (self.span_count < span_buffer_capacity) self.span_count += 1;
@@ -325,10 +343,10 @@ pub const Tracer = struct {
     pub fn flush(self: *Tracer) !void {
         const url = self.config.collector_url orelse return;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.io);
         const n = self.span_count;
         if (n == 0) {
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return;
         }
 
@@ -341,7 +359,7 @@ pub const Tracer = struct {
         for (0..n) |i| batch[i] = self.spans[(start_idx + i) % span_buffer_capacity];
         self.span_count = 0;
         self.span_head = 0;
-        self.mutex.unlock();
+        self.mutex.unlock(self.io);
 
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -364,7 +382,7 @@ pub const Tracer = struct {
             }
         }
 
-        var client: std.http.Client = .{ .allocator = arena };
+        var client: std.http.Client = .{ .allocator = arena, .io = self.io };
         defer client.deinit();
 
         var discard_buf: [1024]u8 = undefined;
@@ -388,14 +406,14 @@ pub const Tracer = struct {
 // =====================================================================
 
 /// Read OTEL_* env vars and return a Config. Strings are allocated with
-/// `allocator` and released by `Tracer.deinit()`.
-pub fn configFromEnv(allocator: std.mem.Allocator, defaults: ConfigDefaults) !Config {
-    const env = try std.process.getEnvMap(allocator);
-    defer {
-        var m = env;
-        m.deinit();
-    }
-
+/// `allocator` and released by `Tracer.deinit()`. `env` is the process
+/// environment map — pass `init.environ_map` from `pub fn main(init)`,
+/// or build one for tests via `std.process.Environ.createMap`.
+pub fn configFromEnv(
+    allocator: std.mem.Allocator,
+    env: *const std.process.Environ.Map,
+    defaults: ConfigDefaults,
+) !Config {
     // Explicit kill switch.
     if (env.get("OTEL_SDK_DISABLED")) |v| {
         if (std.ascii.eqlIgnoreCase(v, "true")) {
@@ -447,7 +465,7 @@ pub fn configFromEnv(allocator: std.mem.Allocator, defaults: ConfigDefaults) !Co
     };
 }
 
-fn resolveServiceName(env: std.process.EnvMap, defaults: ConfigDefaults) []const u8 {
+fn resolveServiceName(env: *const std.process.Environ.Map, defaults: ConfigDefaults) []const u8 {
     return env.get("OTEL_SERVICE_NAME") orelse defaults.service_name;
 }
 
@@ -622,7 +640,7 @@ fn hexVal(c: u8) ?u4 {
 
 test "traceparent parse + format roundtrip" {
     const header = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-    const ctx = parseTraceparent(header) orelse return error.ParseFailed;
+    const ctx = parseTraceparent(null, header) orelse return error.ParseFailed;
 
     try std.testing.expect(ctx.sampled);
 
@@ -632,11 +650,11 @@ test "traceparent parse + format roundtrip" {
 }
 
 test "traceparent parse: bad length" {
-    try std.testing.expect(parseTraceparent("too-short") == null);
+    try std.testing.expect(parseTraceparent(null, "too-short") == null);
 }
 
 test "traceparent parse: bad hex" {
-    try std.testing.expect(parseTraceparent("00-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ-00f067aa0ba902b7-01") == null);
+    try std.testing.expect(parseTraceparent(null, "00-ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ-00f067aa0ba902b7-01") == null);
 }
 
 test "hex roundtrip 16" {
@@ -659,7 +677,7 @@ test "Tracer disabled: startSpan returns null_ctx" {
         .enabled = false,
         .service_name = try std.testing.allocator.dupe(u8, "test"),
     };
-    var tracer = Tracer.init(std.testing.allocator, cfg);
+    var tracer = Tracer.init(std.testing.allocator, std.testing.io, cfg);
     defer tracer.deinit();
     const span = tracer.startSpan("x", null);
     try std.testing.expect(span.isNull());
@@ -670,7 +688,7 @@ test "Tracer enabled: endSpan stores in buffer" {
         .enabled = true,
         .service_name = try std.testing.allocator.dupe(u8, "test"),
     };
-    var tracer = Tracer.init(std.testing.allocator, cfg);
+    var tracer = Tracer.init(std.testing.allocator, std.testing.io, cfg);
     defer tracer.deinit();
 
     const ctx = tracer.startSpan("span-a", null);
@@ -686,7 +704,7 @@ test "Tracer: parent/child share trace_id, differ on span_id" {
         .enabled = true,
         .service_name = try std.testing.allocator.dupe(u8, "test"),
     };
-    var tracer = Tracer.init(std.testing.allocator, cfg);
+    var tracer = Tracer.init(std.testing.allocator, std.testing.io, cfg);
     defer tracer.deinit();
 
     const parent = tracer.startSpan("p", null);
@@ -704,7 +722,7 @@ test "Tracer: concurrent flush from background thread (daemon use case)" {
         .enabled = true,
         .service_name = try std.testing.allocator.dupe(u8, "daemon"),
     };
-    var tracer = Tracer.init(std.testing.allocator, cfg);
+    var tracer = Tracer.init(std.testing.allocator, std.testing.io, cfg);
     defer tracer.deinit();
 
     var stop = std.atomic.Value(bool).init(false);
@@ -712,7 +730,7 @@ test "Tracer: concurrent flush from background thread (daemon use case)" {
     const Worker = struct {
         fn loop(t: *Tracer, s: *std.atomic.Value(bool)) void {
             while (!s.load(.acquire)) {
-                std.Thread.sleep(2 * std.time.ns_per_ms);
+                Io.sleep(t.io, .fromMilliseconds(2), .awake) catch return;
                 t.flush() catch {};
             }
         }
@@ -736,7 +754,7 @@ test "OTLP JSON serialization includes service fields only when non-empty" {
         .service_name = try std.testing.allocator.dupe(u8, "svc"),
         .service_version = "1.2.3",
     };
-    var tracer = Tracer.init(std.testing.allocator, cfg);
+    var tracer = Tracer.init(std.testing.allocator, std.testing.io, cfg);
     defer tracer.deinit();
 
     const ctx = tracer.startSpan("http.request", null);
