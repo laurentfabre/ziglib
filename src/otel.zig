@@ -433,7 +433,7 @@ pub fn configFromEnv(
         }
         if (env.get("OTEL_EXPORTER_OTLP_ENDPOINT")) |base| {
             if (base.len == 0) break :blk null;
-            const trimmed = std.mem.trimRight(u8, base, "/");
+            const trimmed = std.mem.trimEnd(u8, base, "/");
             break :blk try std.fmt.allocPrint(allocator, "{s}/v1/traces", .{trimmed});
         }
         break :blk null;
