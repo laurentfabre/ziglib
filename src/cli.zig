@@ -93,21 +93,32 @@ fn containsFlag(flags: []const []const u8, needle: []const u8) bool {
 /// the returned slice.
 pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
+    const hex_chars = "0123456789ABCDEF";
     for (input) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
             try buf.append(allocator, c);
         } else {
-            try buf.writer(allocator).print("%{X:0>2}", .{c});
+            try buf.appendSlice(allocator, &[_]u8{
+                '%',
+                hex_chars[(c >> 4) & 0xF],
+                hex_chars[c & 0xF],
+            });
         }
     }
     return buf.toOwnedSlice(allocator);
 }
 
-/// Read the user's `$HOME`. Returns `error.NoHomeDir` if the variable is
-/// unset or empty. Always returns an owned slice — callers should prefer
-/// this over raw `posix.getenv` so ownership semantics stay uniform.
-pub fn homeDir(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
+/// Read the user's `$HOME` from `env`. Returns `error.NoHomeDir` if the
+/// variable is unset or empty. Always returns an owned slice — callers
+/// should prefer this over raw `posix.getenv` so ownership semantics
+/// stay uniform.
+///
+/// Pass `init.environ_map` from `pub fn main(init: std.process.Init)`,
+/// or build a Map via `std.process.Environ.createMap` for tests.
+pub fn homeDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]u8 {
+    const home = env.get("HOME") orelse return error.NoHomeDir;
+    if (home.len == 0) return error.NoHomeDir;
+    return allocator.dupe(u8, home);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@
 //! like a perpetual miss.
 
 const std = @import("std");
+const Io = std.Io;
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
@@ -29,10 +30,11 @@ pub const Cache = struct {
     /// not exist (recursively). If `ttl_override` is null, uses default 1h.
     pub fn initAt(
         allocator: std.mem.Allocator,
+        io: Io,
         base_dir: []const u8,
         ttl_override: ?u64,
     ) !Cache {
-        ensureDirRecursive(base_dir) catch {};
+        ensureDirRecursive(io, base_dir) catch {};
         return .{
             .allocator = allocator,
             .base_dir = base_dir,
@@ -47,10 +49,11 @@ pub const Cache = struct {
     /// own the lifetime.
     pub fn initAtOwned(
         allocator: std.mem.Allocator,
+        io: Io,
         base_dir: []u8,
         ttl_override: ?u64,
     ) !Cache {
-        ensureDirRecursive(base_dir) catch {};
+        ensureDirRecursive(io, base_dir) catch {};
         return .{
             .allocator = allocator,
             .base_dir = base_dir,
@@ -65,20 +68,22 @@ pub const Cache = struct {
 
     /// Read a cached value. Caller owns the returned bytes and must call
     /// `allocator.free`. Returns null on miss, expiry, or any I/O error.
-    pub fn get(self: *Cache, key: []const u8) ?[]const u8 {
+    pub fn get(self: *Cache, io: Io, key: []const u8) ?[]const u8 {
         const path = self.keyToPath(key) catch return null;
         defer self.allocator.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-        defer file.close();
+        var file = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+        defer file.close(io);
 
-        const stat = file.stat() catch return null;
-        const now_ns: i128 = @intCast(std.time.nanoTimestamp());
-        const age_ns = now_ns - stat.mtime;
-        const ttl_ns: i128 = @as(i128, self.ttl_seconds) * std.time.ns_per_s;
+        const stat = file.stat(io) catch return null;
+        const now_ts = Io.Clock.Timestamp.now(io, .real);
+        const age_ns = now_ts.raw.nanoseconds - stat.mtime.nanoseconds;
+        const ttl_ns: i96 = @as(i96, @intCast(self.ttl_seconds)) * std.time.ns_per_s;
         if (age_ns > ttl_ns) return null;
 
-        return file.readToEndAlloc(self.allocator, std.math.maxInt(usize)) catch null;
+        var read_buf: [4096]u8 = undefined;
+        var fr = file.reader(io, &read_buf);
+        return fr.interface.allocRemaining(self.allocator, .unlimited) catch null;
     }
 
     /// Read a cached value, bypassing the TTL check — returns whatever
@@ -86,24 +91,29 @@ pub const Cache = struct {
     /// callers normally use `get`, then fall back to `getStale` only
     /// when the live fetch has already failed. Caller owns the returned
     /// bytes; null on miss or any I/O error.
-    pub fn getStale(self: *Cache, key: []const u8) ?[]const u8 {
+    pub fn getStale(self: *Cache, io: Io, key: []const u8) ?[]const u8 {
         const path = self.keyToPath(key) catch return null;
         defer self.allocator.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-        defer file.close();
+        var file = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+        defer file.close(io);
 
-        return file.readToEndAlloc(self.allocator, std.math.maxInt(usize)) catch null;
+        var read_buf: [4096]u8 = undefined;
+        var fr = file.reader(io, &read_buf);
+        return fr.interface.allocRemaining(self.allocator, .unlimited) catch null;
     }
 
     /// Write a value to the cache. Silently drops write errors; callers
     /// treat cache writes as best-effort.
-    pub fn put(self: *Cache, key: []const u8, value: []const u8) void {
+    pub fn put(self: *Cache, io: Io, key: []const u8, value: []const u8) void {
         const path = self.keyToPath(key) catch return;
         defer self.allocator.free(path);
-        const file = std.fs.createFileAbsolute(path, .{}) catch return;
-        defer file.close();
-        file.writeAll(value) catch {};
+        var file = Io.Dir.createFileAbsolute(io, path, .{}) catch return;
+        defer file.close(io);
+        var write_buf: [4096]u8 = undefined;
+        var fw = file.writer(io, &write_buf);
+        fw.interface.writeAll(value) catch return;
+        fw.interface.flush() catch return;
     }
 
     /// Convenience: build a cache key by joining `components` with ':'.
@@ -142,108 +152,113 @@ pub const Cache = struct {
     }
 };
 
-fn ensureDirRecursive(path: []const u8) !void {
-    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+fn ensureDirRecursive(io: Io, path: []const u8) !void {
+    // 0.16's `createDirPath` walks the chain itself; treat
+    // `PathAlreadyExists` as success.
+    Io.Dir.cwd().createDirPath(io, path) catch |err| switch (err) {
         error.PathAlreadyExists => return,
-        error.FileNotFound => {
-            if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
-                if (sep > 0) {
-                    try ensureDirRecursive(path[0..sep]);
-                    std.fs.makeDirAbsolute(path) catch |e2| switch (e2) {
-                        error.PathAlreadyExists => {},
-                        else => return e2,
-                    };
-                }
-            }
-        },
         else => return err,
     };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
+//
+// `tmpDir` returns a directory under `.zig-cache/tmp/<random>/`. We compose
+// an absolute path against that random sub-path for the cache root.
+
+fn tmpAbsPath(allocator: std.mem.Allocator, io: Io, sub_path: []const u8) ![]u8 {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try std.process.currentPath(io, &cwd_buf);
+    return std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buf[0..n], sub_path });
+}
 
 test "Cache: put/get roundtrip" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, null);
+    var cache = try Cache.initAt(allocator, io, abs, null);
     defer cache.deinit();
 
-    cache.put("alpha", "hello world");
-    const v = cache.get("alpha") orelse return error.UnexpectedMiss;
+    cache.put(io, "alpha", "hello world");
+    const v = cache.get(io, "alpha") orelse return error.UnexpectedMiss;
     defer allocator.free(v);
     try std.testing.expectEqualStrings("hello world", v);
 }
 
 test "Cache: miss returns null" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, null);
+    var cache = try Cache.initAt(allocator, io, abs, null);
     defer cache.deinit();
 
-    try std.testing.expect(cache.get("absent") == null);
+    try std.testing.expect(cache.get(io, "absent") == null);
 }
 
 test "Cache: expired entry returns null" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, 0); // 0s TTL → always expired
+    var cache = try Cache.initAt(allocator, io, abs, 0); // 0s TTL → always expired
     defer cache.deinit();
 
-    cache.put("stale", "bytes");
+    cache.put(io, "stale", "bytes");
     // With TTL=0, any positive age exceeds the window. Sleep a tick to
     // ensure mtime < now on filesystems with second-resolution timestamps.
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    try std.testing.expect(cache.get("stale") == null);
+    Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(cache.get(io, "stale") == null);
 }
 
 test "Cache: getStale returns expired entries that get() drops" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, 0); // 0s TTL → always expired
+    var cache = try Cache.initAt(allocator, io, abs, 0); // 0s TTL → always expired
     defer cache.deinit();
 
-    cache.put("alpha", "still useful offline");
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    cache.put(io, "alpha", "still useful offline");
+    Io.sleep(io, .fromMilliseconds(10), .awake) catch {};
 
-    try std.testing.expect(cache.get("alpha") == null);
-    const stale = cache.getStale("alpha") orelse return error.UnexpectedMiss;
+    try std.testing.expect(cache.get(io, "alpha") == null);
+    const stale = cache.getStale(io, "alpha") orelse return error.UnexpectedMiss;
     defer allocator.free(stale);
     try std.testing.expectEqualStrings("still useful offline", stale);
 }
 
 test "Cache: getStale returns null when the key has never been written" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, null);
+    var cache = try Cache.initAt(allocator, io, abs, null);
     defer cache.deinit();
 
-    try std.testing.expect(cache.getStale("never-written") == null);
+    try std.testing.expect(cache.getStale(io, "never-written") == null);
 }
 
 test "Cache: makeKey joins components with ':'" {
@@ -256,18 +271,19 @@ test "Cache: makeKey joins components with ':'" {
 test "Cache: put with long key is hashed into filename" {
     // A 500-byte key still hashes into a fixed-length filename (64 hex + .bin).
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const abs = try tmp.dir.realpathAlloc(allocator, ".");
+    const abs = try tmpAbsPath(allocator, io, &tmp.sub_path);
     defer allocator.free(abs);
 
-    var cache = try Cache.initAt(allocator, abs, null);
+    var cache = try Cache.initAt(allocator, io, abs, null);
     defer cache.deinit();
 
     const long_key = "x" ** 500;
-    cache.put(long_key, "ok");
-    const v = cache.get(long_key) orelse return error.UnexpectedMiss;
+    cache.put(io, long_key, "ok");
+    const v = cache.get(io, long_key) orelse return error.UnexpectedMiss;
     defer allocator.free(v);
     try std.testing.expectEqualStrings("ok", v);
 }

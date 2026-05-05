@@ -66,27 +66,27 @@ pub const Book = struct {
     shared_strings: [][]const u8 = &.{},
     /// Owned decoded shared strings when entity decoding was needed.
     /// Empty if every SST entry was verbatim.
-    shared_owned: std.ArrayListUnmanaged([]u8) = .{},
+    shared_owned: std.ArrayListUnmanaged([]u8) = .empty,
     /// (name, path) for each `<sheet>` in the workbook, in declared order.
     sheets: []Sheet = &.{},
     /// Decompressed bytes of each sheet's XML, keyed by path.
-    sheet_data: std.StringHashMapUnmanaged([]u8) = .{},
+    sheet_data: std.StringHashMapUnmanaged([]u8) = .empty,
     /// Owned backing storage for every string referenced by `sheets`,
     /// sheet_data keys, and entity-decoded shared strings.
-    strings: std.ArrayListUnmanaged([]u8) = .{},
+    strings: std.ArrayListUnmanaged([]u8) = .empty,
 
     /// Open and parse the workbook skeleton. Sheet XML is eagerly
     /// decompressed (xlsx files we target are small — ~300 KB — and
     /// streaming through std.zip is awkward).
-    pub fn open(allocator: Allocator, path: []const u8) !Book {
+    pub fn open(allocator: Allocator, io: std.Io, path: []const u8) !Book {
         var book: Book = .{ .allocator = allocator };
         errdefer book.deinit();
 
-        var file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
 
         var buf: [4096]u8 = undefined;
-        var file_reader = file.reader(&buf);
+        var file_reader = file.reader(io, &buf);
 
         var iter = std.zip.Iterator.init(&file_reader) catch return error.BadZip;
 
@@ -180,8 +180,8 @@ pub const Book = struct {
             .pos = 0,
             .shared_strings = self.shared_strings,
             .allocator = allocator,
-            .row_cells = .{},
-            .owned = .{},
+            .row_cells = .empty,
+            .owned = .empty,
         };
     }
 };
@@ -352,7 +352,7 @@ pub const Rows = struct {
         }
 
         // Multi-run or entity-bearing — allocate.
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
         var i: usize = 0;
         while (std.mem.indexOfPos(u8, body, i, "<t")) |t_start| {
@@ -374,7 +374,7 @@ pub const Rows = struct {
     /// an owned slice and track it in `self.owned`.
     fn internOrBorrow(self: *Rows, raw: []const u8) ![]const u8 {
         if (std.mem.indexOfScalar(u8, raw, '&') == null) return raw;
-        var buf: std.ArrayListUnmanaged(u8) = .{};
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
         try appendDecoded(self.allocator, &buf, raw);
         const owned = try buf.toOwnedSlice(self.allocator);
@@ -514,7 +514,7 @@ fn appendDecoded(
 
 fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !void {
     // Parse rels first into an id → target map.
-    var rel_map: std.StringHashMapUnmanaged([]const u8) = .{};
+    var rel_map: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer rel_map.deinit(book.allocator);
 
     var i: usize = 0;
@@ -534,7 +534,7 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
     }
 
     // Walk <sheet name="..." r:id="..."/> in workbook.xml.
-    var sheets: std.ArrayListUnmanaged(Sheet) = .{};
+    var sheets: std.ArrayListUnmanaged(Sheet) = .empty;
     errdefer sheets.deinit(book.allocator);
 
     i = 0;
@@ -561,7 +561,7 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
         };
 
         // Path is relative to xl/ — prepend if not absolute. Own it.
-        var path_buf: std.ArrayListUnmanaged(u8) = .{};
+        var path_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer path_buf.deinit(book.allocator);
         if (std.mem.startsWith(u8, target, "/")) {
             try path_buf.appendSlice(book.allocator, target[1..]);
@@ -573,7 +573,7 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
         try book.strings.append(book.allocator, path);
 
         // Name needs entity decoding (hotels with & in their names).
-        var name_buf: std.ArrayListUnmanaged(u8) = .{};
+        var name_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer name_buf.deinit(book.allocator);
         try appendDecoded(book.allocator, &name_buf, name);
         const name_decoded = try name_buf.toOwnedSlice(book.allocator);
@@ -589,7 +589,7 @@ fn parseWorkbookSheets(book: *Book, wb_xml: []const u8, rels_xml: []const u8) !v
 // ─── sharedStrings.xml parsing ───────────────────────────────────────
 
 fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
-    var strings: std.ArrayListUnmanaged([]const u8) = .{};
+    var strings: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer strings.deinit(book.allocator);
 
     var i: usize = 0;
@@ -605,7 +605,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         const body = sst_xml[si_gt + 1 .. si_close];
 
         // Concatenate every <t>…</t> in the body.
-        var concat: std.ArrayListUnmanaged(u8) = .{};
+        var concat: std.ArrayListUnmanaged(u8) = .empty;
         errdefer concat.deinit(book.allocator);
         var needs_decoding = false;
 
@@ -624,7 +624,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
         }
 
         if (needs_decoding) {
-            var decoded: std.ArrayListUnmanaged(u8) = .{};
+            var decoded: std.ArrayListUnmanaged(u8) = .empty;
             errdefer decoded.deinit(book.allocator);
             try appendDecoded(book.allocator, &decoded, concat.items);
             concat.deinit(book.allocator);
@@ -669,7 +669,7 @@ fn parseSharedStrings(book: *Book, sst_xml: []u8) !void {
 fn extractEntryToBuffer(
     allocator: Allocator,
     entry: std.zip.Iterator.Entry,
-    stream: *std.fs.File.Reader,
+    stream: *std.Io.File.Reader,
 ) ![]u8 {
     switch (entry.compression_method) {
         .store, .deflate => {},
@@ -723,7 +723,7 @@ test "getAttr" {
 
 test "appendDecoded entities" {
     const alloc = std.testing.allocator;
-    var buf: std.ArrayListUnmanaged(u8) = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
     try appendDecoded(alloc, &buf, "Smith &amp; Co &lt;HQ&gt; &#233;");
     try std.testing.expectEqualStrings("Smith & Co <HQ> é", buf.items);
@@ -762,28 +762,16 @@ test "parseNumericCell" {
 const fuzz_default_iters: usize = 1_000;
 const fuzz_max_input_len: usize = 4_096;
 
+// Fuzz config knobs. Previously env-driven (XLSX_FUZZ_ITERS / XLSX_FUZZ_SEED);
+// 0.16's stricter Init/Environ plumbing made env reads inside `test` blocks
+// awkward. Defaults are chosen to be fast (CI-friendly) and deterministic
+// (`std.testing.random_seed` makes failures re-runnable).
 fn fuzzIterations() usize {
-    const env = std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_ITERS") catch return fuzz_default_iters;
-    defer std.heap.page_allocator.free(env);
-    // Strip underscores so humans can write "1_000_000".
-    var digits_buf: [32]u8 = undefined;
-    var di: usize = 0;
-    for (env) |c| {
-        if (c == '_') continue;
-        if (di == digits_buf.len) break;
-        digits_buf[di] = c;
-        di += 1;
-    }
-    return std.fmt.parseInt(usize, digits_buf[0..di], 10) catch fuzz_default_iters;
+    return fuzz_default_iters;
 }
 
 fn fuzzSeed() u64 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "XLSX_FUZZ_SEED")) |s| {
-        defer std.heap.page_allocator.free(s);
-        return std.fmt.parseInt(u64, s, 10) catch 0xA1F8ED;
-    } else |_| {
-        return @bitCast(std.time.milliTimestamp());
-    }
+    return std.testing.random_seed;
 }
 
 fn randomInput(rng: std.Random, buf: []u8) []u8 {
@@ -822,7 +810,7 @@ test "fuzz appendDecoded" {
     var buf: [512]u8 = undefined;
     for (0..iters) |_| {
         const input = randomInput(rng, &buf);
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(std.testing.allocator);
         appendDecoded(std.testing.allocator, &out, input) catch {};
     }
@@ -1052,8 +1040,8 @@ fn consumeAllRows(alloc: std.mem.Allocator, shared_strings: []const []const u8, 
         .pos = 0,
         .shared_strings = shared_strings,
         .allocator = alloc,
-        .row_cells = .{},
-        .owned = .{},
+        .row_cells = .empty,
+        .owned = .empty,
     };
     defer rows.deinit();
     var count: usize = 0;
@@ -1096,7 +1084,7 @@ test "fuzz appendDecoded mutations" {
     var dst: [512]u8 = undefined;
     for (0..iters) |_| {
         const input = mutate(rng, entity_template, &dst);
-        var out: std.ArrayListUnmanaged(u8) = .{};
+        var out: std.ArrayListUnmanaged(u8) = .empty;
         defer out.deinit(std.testing.allocator);
         appendDecoded(std.testing.allocator, &out, input) catch {};
     }
@@ -1108,6 +1096,7 @@ test "fuzz Book.open against arbitrary bytes" {
     // of inputs will accidentally pass the zip header and exercise the
     // XML parsers downstream.
     const iters = fuzzIterations() / 4; // file IO is expensive; scale down
+    const io = std.testing.io;
     var prng = std.Random.DefaultPrng.init(fuzzSeed());
     const rng = prng.random();
     var buf: [fuzz_max_input_len]u8 = undefined;
@@ -1116,11 +1105,11 @@ test "fuzz Book.open against arbitrary bytes" {
 
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        tmp.dir.writeFile(.{ .sub_path = "fuzz.xlsx", .data = input }) catch continue;
-        const path = tmp.dir.realpathAlloc(std.testing.allocator, "fuzz.xlsx") catch continue;
+        tmp.dir.writeFile(io, .{ .sub_path = "fuzz.xlsx", .data = input }) catch continue;
+        const path = tmp.dir.realPathFileAlloc(io, "fuzz.xlsx", std.testing.allocator) catch continue;
         defer std.testing.allocator.free(path);
 
-        var book = Book.open(std.testing.allocator, path) catch continue;
+        var book = Book.open(std.testing.allocator, io, path) catch continue;
         defer book.deinit();
 
         for (book.sheets) |sheet| {
